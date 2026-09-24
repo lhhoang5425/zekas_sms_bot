@@ -52,7 +52,9 @@ async def load_services(provider: str | None = None) -> list[dict]:
 
 async def service_by_id(service_id: str | int) -> dict | None:
     sid = str(service_id)
-    return next((row for row in await load_services(None) if str(row.get("id", "")) == sid), None)
+    if sid.startswith("cmsnpa:"):
+        return next((row for row in await load_services("npa") if str(row.get("id", "")) == sid), None)
+    return next((row for row in await load_services("codesim") if str(row.get("id", "")) == sid), None)
 
 
 def providers_keyboard() -> InlineKeyboardMarkup:
@@ -114,7 +116,8 @@ async def send_service_page(message: Message, provider: str = "npa", page: int =
     )
 
 
-async def poll_otp(bot: Bot, purchase_id: int, user_id: int, otp_id: int | str) -> None:
+async def poll_otp(bot: Bot, purchase_id: int, user_id: int, otp_id: int | str, message_id: int | None = None) -> None:
+    last_edit_time = 0.0
     while True:
         await asyncio.sleep(5)
         purchase = database.purchase_for_user(purchase_id, user_id)
@@ -123,6 +126,39 @@ async def poll_otp(bot: Bot, purchase_id: int, user_id: int, otp_id: int | str) 
         created_at = datetime.fromisoformat(purchase["created_at"])
         age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
         provider = str(purchase["provider"] or "codesim") if "provider" in purchase.keys() else "codesim"
+
+        # Nếu là nguồn NPA và có message_id, định kỳ cập nhật đồng hồ đếm ngược 300s
+        wait_limit = 300 if provider == "cmsnpa" else PROVIDER_WAIT_SECONDS
+        remaining_seconds = max(0, int(wait_limit - age_seconds))
+
+        if provider == "cmsnpa" and message_id:
+            now_ts = asyncio.get_event_loop().time()
+            if now_ts - last_edit_time >= 15 and remaining_seconds > 0:
+                last_edit_time = now_ts
+                service_name = str(purchase["service_name"] or "")
+                phone_num = str(purchase["phone_number"] or "")
+                price_val = int(purchase["price"] or 0)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=message_id,
+                        text=(
+                            f"✅ <b>ĐÃ THUÊ SỐ THÀNH CÔNG</b>\n\n"
+                            f"Dịch vụ: <b>{html.escape(service_name)}</b>\n"
+                            f"Nhà mạng / Nguồn: <b>Tự động (NPA)</b>\n"
+                            f"Số điện thoại: <code>{html.escape(phone_num)}</code>\n"
+                            f"Giá: <b>{price_val:,} ₫</b>\n"
+                            f"Trạng thái: <b>Đang chờ OTP... ({remaining_seconds}s)</b>\n\n"
+                            f"<i>(Thời gian chờ còn lại {remaining_seconds}s. Tự động hoàn tiền nếu không có OTP)</i>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🧾 Lịch sử thuê", callback_data="menu:history")],
+                        ]),
+                    )
+                except Exception:
+                    pass
+
         data = None
         try:
             data = await asyncio.to_thread(provider_gateway.otp, otp_id, provider=provider)
@@ -198,7 +234,6 @@ async def poll_otp(bot: Bot, purchase_id: int, user_id: int, otp_id: int | str) 
                     parse_mode=ParseMode.HTML,
                 )
                 return
-        wait_limit = 300 if provider == "cmsnpa" else PROVIDER_WAIT_SECONDS
         if age_seconds < wait_limit:
             continue
         try:
@@ -220,7 +255,7 @@ async def poll_otp(bot: Bot, purchase_id: int, user_id: int, otp_id: int | str) 
         if refund:
             await bot.send_message(
                 user_id,
-                "⌛ <b>SỐ ĐÃ HẾT THỜI GIAN CHỜ</b>\n\n"
+                "⌛ <b>SỐ ĐÃ HẾT THỜI GIAN CHỜ (300s)</b>\n\n"
                 f"Không ghi nhận OTP. Đã hoàn <b>{refund['amount']:,} ₫</b> về ví.\n"
                 f"Số dư mới: <b>{refund['balance']:,} ₫</b>",
                 parse_mode=ParseMode.HTML,
@@ -435,8 +470,16 @@ async def cancel_phone_command(message: Message) -> None:
         await message.answer("Không tìm thấy đơn đang chờ OTP của số điện thoại này trong tài khoản của bạn.")
         return
 
-    latest = None
     provider = str(purchase["provider"] or "codesim") if "provider" in purchase.keys() else "codesim"
+    if provider == "cmsnpa":
+        await message.answer(
+            "ℹ️ <b>DỊCH VỤ NGUỒN NPA</b>\n\n"
+            "Dịch vụ từ nguồn NPA không hỗ trợ hủy số chủ động giữa chừng.\n"
+            "Hệ thống đếm ngược <b>300 giây</b>, nếu không nhận được OTP sẽ <b>tự động hoàn tiền 100%</b> về ví của bạn.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    latest = None
     try:
         latest = await asyncio.to_thread(provider_gateway.otp, purchase["otp_id"], provider=provider)
     except Exception:
@@ -979,19 +1022,31 @@ async def rent_execute(callback: CallbackQuery) -> None:
             network_id,
             provider=provider,
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Hủy số", callback_data=f"rent:cancel:{reservation['id']}")],
-            [InlineKeyboardButton(text="🧾 Lịch sử thuê", callback_data="menu:history")],
-        ])
+        if provider == "cmsnpa":
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧾 Lịch sử thuê", callback_data="menu:history")],
+            ])
+            status_text = "Đang chờ OTP... (300s)"
+            note_text = "\n<i>(Nguồn NPA tự động hoàn tiền sau 300s nếu không có OTP)</i>"
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Hủy số", callback_data=f"rent:cancel:{reservation['id']}")],
+                [InlineKeyboardButton(text="🧾 Lịch sử thuê", callback_data="menu:history")],
+            ])
+            status_text = "Đang chờ OTP..."
+            note_text = ""
+
+        rental_msg = None
         if callback.message:
-            await callback.message.answer(
+            rental_msg = await callback.message.answer(
                 f"✅ <b>ĐÃ THUÊ SỐ THÀNH CÔNG</b>\n\n"
                 f"Dịch vụ: <b>{html.escape(str(service['name']))}</b>\n"
                 f"Nhà mạng / Nguồn: <b>{html.escape(network_name)}</b>\n"
                 f"Số điện thoại: <code>{html.escape(rental.phone)}</code>\n"
                 f"Giá: <b>{price:,} ₫</b>\n"
-                f"Trạng thái: <b>Đang chờ OTP...</b>\n"
-                f"Số dư còn lại: <b>{reservation['balance']:,} ₫</b>",
+                f"Trạng thái: <b>{status_text}</b>\n"
+                f"Số dư còn lại: <b>{reservation['balance']:,} ₫</b>"
+                f"{note_text}",
                 parse_mode=ParseMode.HTML, reply_markup=keyboard)
         username = f"@{html.escape(callback.from_user.username)}" if callback.from_user.username else "Không có"
         await notify_admins(
@@ -1006,7 +1061,8 @@ async def rent_execute(callback: CallbackQuery) -> None:
             f"Giá: <b>{price:,} ₫</b>",
             tag_admin=False,
         )
-        asyncio.create_task(poll_otp(callback.bot, reservation["id"], user_id, rental.otp_id))
+        msg_id = rental_msg.message_id if rental_msg else None
+        asyncio.create_task(poll_otp(callback.bot, reservation["id"], user_id, rental.otp_id, message_id=msg_id))
 
 
 @router.callback_query(F.data.startswith("rent:otp:"))
@@ -1023,9 +1079,12 @@ async def rent_cancel(callback: CallbackQuery) -> None:
     purchase = database.purchase_for_user(purchase_id, callback.from_user.id)
     if not purchase or purchase["status"] not in {"waiting_otp", "otp_timeout"} or not purchase["sim_id"]:
         await callback.answer("Số này không thể hủy", show_alert=True); return
+    provider = str(purchase["provider"] or "codesim") if "provider" in purchase.keys() else "codesim"
+    if provider == "cmsnpa":
+        await callback.answer("Nguồn NPA không hỗ trợ hủy chủ động. Vui lòng chờ hết thời gian để tự hoàn tiền.", show_alert=True)
+        return
     await callback.answer()
     latest = None
-    provider = str(purchase["provider"] or "codesim") if "provider" in purchase.keys() else "codesim"
     try:
         latest = await asyncio.to_thread(provider_gateway.otp, purchase["otp_id"], provider=provider)
     except Exception:

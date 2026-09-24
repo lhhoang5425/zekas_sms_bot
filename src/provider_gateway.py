@@ -101,14 +101,12 @@ def rent_by_network_priority(service_id: int) -> tuple[Rental, dict]:
 
 def rent_cmsnpa(server_id: str) -> tuple[Rental, dict]:
     rental = cmsnpa_gateway.rent(server_id)
-    # Mapping về format chung Rental và mock network
+    # Mapping về format chung Rental của bot
     r = Rental(
         otp_id=rental.otp_id,
         sim_id=rental.sim_id,
         phone=rental.phone,
-        service_id=server_id,
         service_name=rental.app,
-        price=rental.price,
         payment=rental.price,
     )
     network_info = {"id": 0, "name": "Tự động (NPA)"}
